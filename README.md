@@ -1,4 +1,4 @@
-# DroneWatch 🛸
+# DroneWatch by Bhavesh Maurya & Kumar Saurabh 🛸
 > Real-time multimodal vision AI — powered by Gemini Live API + A2A multi-agent architecture
 
 **NYC Build With AI Hackathon — NYU Tandon School of Engineering | NYC Open Data Week 2026**
