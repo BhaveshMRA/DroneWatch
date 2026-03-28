@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
-const VISION_BASE = 'http://localhost:8001'
-const ORCH_BASE   = 'http://localhost:8000'
+const HOST_IP = window.location.hostname;
+const VISION_BASE = `http://${HOST_IP}:8001`;
+const ORCH_BASE   = `http://${HOST_IP}:8000`;
 
 // AudioWorklet processor — captures raw PCM Int16 chunks at 16kHz
 const WORKLET_CODE = `
@@ -281,7 +282,7 @@ export default function App() {
   useEffect(() => {
     let ws, timer
     const connect = () => {
-      ws = new WebSocket(`ws://localhost:8001/ws`)
+      ws = new WebSocket(`ws://${window.location.hostname}:8001/ws`)
       ws.onopen = () => { setWsStatus('CONNECTED'); setStatus('live') }
       ws.onmessage = (e) => { if (e.data !== 'ping') processAlert(e.data) }
       ws.onclose = () => { setWsStatus('RECONNECTING'); setStatus('connecting'); timer = setTimeout(connect, 2000) }
@@ -295,7 +296,7 @@ export default function App() {
   useEffect(() => {
     let ws, timer
     const connect = () => {
-      ws = new WebSocket(`ws://localhost:8000/ws`)
+      ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`)
       orchWsRef.current = ws
       ws.onmessage = (e) => processAlert(`[AI]: ${e.data}`)
       ws.onclose = () => { timer = setTimeout(connect, 3000) }
@@ -383,7 +384,7 @@ export default function App() {
       workletRef.current = worklet
       source.connect(worklet)
 
-      const ws = new WebSocket(`ws://localhost:8000/voice`)
+      const ws = new WebSocket(`ws://${window.location.hostname}:8000/voice`)
       voiceWsRef.current = ws
 
       ws.onopen = () => {
