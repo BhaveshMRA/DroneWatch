@@ -3,6 +3,35 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 const VISION_BASE = 'http://localhost:8001'
 const ORCH_BASE   = 'http://localhost:8000'
 
+// AudioWorklet processor — captures raw PCM Int16 chunks at 16kHz
+const WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buffer = [];
+    this._bufferSize = 2048;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const samples = input[0];
+    for (let i = 0; i < samples.length; i++) {
+      this._buffer.push(Math.max(-1, Math.min(1, samples[i])));
+    }
+    while (this._buffer.length >= this._bufferSize) {
+      const chunk = this._buffer.splice(0, this._bufferSize);
+      const int16 = new Int16Array(this._bufferSize);
+      for (let i = 0; i < this._bufferSize; i++) {
+        int16[i] = Math.round(chunk[i] * 32767);
+      }
+      this.port.postMessage(int16.buffer, [int16.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`
+
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;700&display=swap');
 
@@ -39,6 +68,15 @@ const STYLES = `
   .badge-conn    { background:rgba(255,204,0,.1); border-color:var(--yellow); color:var(--yellow); }
   .badge-offline { background:rgba(255,51,85,.1); border-color:var(--red); color:var(--red); }
 
+  .agent-pills { display:flex; gap:8px; align-items:center; }
+  .agent-pill {
+    padding: 2px 10px; border-radius: 20px; font-size: 10px; font-weight: 600;
+    letter-spacing: 1px; border: 1px solid var(--border); color: var(--dim);
+    background: var(--bg3); transition: all .3s;
+  }
+  .agent-pill.ok  { border-color:rgba(0,255,136,.4); color:var(--accent); background:rgba(0,255,136,.06); }
+  .agent-pill.err { border-color:rgba(255,51,85,.4); color:var(--red); background:rgba(255,51,85,.06); }
+
   .main { display: flex; height: calc(100vh - 52px); }
 
   .panel-feed { flex:1; position:relative; background:#000; overflow:hidden; }
@@ -69,6 +107,7 @@ const STYLES = `
   .alert-clear   { border-color:var(--accent); background:rgba(0,255,136,.05); color:var(--accent); }
   .alert-alert   { border-color:var(--red); background:rgba(255,51,85,.08); color:var(--red); animation:flash .5s ease 3; }
   .alert-neutral { border-color:var(--border); background:var(--bg3); color:var(--text); }
+  .alert-ai      { border-color:#7c6fcd; background:rgba(124,111,205,.07); color:#b8b0f0; }
   @keyframes flash { 0%,100%{background:rgba(255,51,85,.08)} 50%{background:rgba(255,51,85,.25)} }
 
   .stats { display:flex; border-top:1px solid var(--border); border-bottom:1px solid var(--border); margin:0 0 4px; }
@@ -88,6 +127,7 @@ const STYLES = `
   .event-clear  { border-color:var(--accent); }
   .event-alert  { border-color:var(--red); }
   .event-neutral{ border-color:var(--dim); }
+  .event-ai     { border-color:#7c6fcd; }
   .event-time   { color:var(--dim); font-size:10px; margin-right:6px; }
 
   .voice-section { padding:14px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:8px; }
@@ -101,6 +141,18 @@ const STYLES = `
   .voice-btn-active { background:rgba(255,51,85,.12)!important; border-color:var(--red)!important; color:var(--red)!important; animation:pulse-btn 1s ease infinite; }
   @keyframes pulse-btn { 0%,100%{box-shadow:0 0 0 0 rgba(255,51,85,.4)} 50%{box-shadow:0 0 0 8px rgba(255,51,85,0)} }
   .voice-hint { font-size:10px; color:var(--dim); text-align:center; letter-spacing:1px; }
+
+  .waveform { display:flex; align-items:center; justify-content:center; gap:3px; height:20px; }
+  .waveform-bar { width:3px; border-radius:2px; background:var(--red); animation:wave 0.6s ease-in-out infinite alternate; }
+  .waveform-bar:nth-child(1){animation-delay:0s}
+  .waveform-bar:nth-child(2){animation-delay:.1s}
+  .waveform-bar:nth-child(3){animation-delay:.2s}
+  .waveform-bar:nth-child(4){animation-delay:.1s}
+  .waveform-bar:nth-child(5){animation-delay:0s}
+  @keyframes wave { from{height:4px} to{height:18px} }
+
+  .speaking-indicator { display:flex; align-items:center; gap:6px; font-size:10px; color:var(--accent); letter-spacing:1px; padding:4px 0; animation:fadeIn .3s ease; }
+  .speaking-dot { width:6px; height:6px; border-radius:50%; background:var(--accent); animation:pulse-dot 0.8s ease-in-out infinite; }
 `
 
 function useTimestamp() {
@@ -119,25 +171,68 @@ function getAlertType(text) {
   const up = text.toUpperCase()
   if (up.startsWith('ALERT')) return 'alert'
   if (up.startsWith('CLEAR')) return 'clear'
+  if (up.startsWith('[AI]') || up.startsWith('[VOICE AI]')) return 'ai'
   return 'neutral'
+}
+
+// ---------------------------------------------------------------------------
+// PCM player — queued playback of Int16 PCM chunks from Gemini Live (24kHz)
+// ---------------------------------------------------------------------------
+function createPCMPlayer() {
+  let ctx = null
+  let nextStartTime = 0
+
+  function getCtx() {
+    if (!ctx) {
+      ctx = new AudioContext({ sampleRate: 24000 })
+      nextStartTime = ctx.currentTime
+    }
+    return ctx
+  }
+
+  return {
+    playChunk(arrayBuffer) {
+      const audioCtx = getCtx()
+      const int16 = new Int16Array(arrayBuffer)
+      const float32 = new Float32Array(int16.length)
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0
+      const buf = audioCtx.createBuffer(1, float32.length, 24000)
+      buf.getChannelData(0).set(float32)
+      const src = audioCtx.createBufferSource()
+      src.buffer = buf
+      src.connect(audioCtx.destination)
+      const startAt = Math.max(audioCtx.currentTime, nextStartTime)
+      src.start(startAt)
+      nextStartTime = startAt + buf.duration
+    },
+    reset() { nextStartTime = ctx ? ctx.currentTime : 0 },
+  }
 }
 
 export default function App() {
   const [frame, setFrame] = useState(null)
-  const [status, setStatus] = useState('connecting') // live | connecting | offline
+  const [status, setStatus] = useState('connecting')
   const [wsStatus, setWsStatus] = useState('CONNECTING')
   const [currentAlert, setCurrentAlert] = useState('Waiting for scene analysis...')
   const [events, setEvents] = useState([])
   const [countClear, setCountClear] = useState(0)
   const [countAlert, setCountAlert] = useState(0)
   const [recording, setRecording] = useState(false)
+  const [speaking, setSpeaking] = useState(false)
   const [query, setQuery] = useState('')
+  const [agentStatus, setAgentStatus] = useState({ vision: 'connecting', nyc: 'connecting' })
 
   const ts = useTimestamp()
-  const orchWsRef = useRef(null)
-  const mediaRecRef = useRef(null)
-  const voiceWsRef = useRef(null)
+  const orchWsRef    = useRef(null)
+  const voiceWsRef   = useRef(null)
+  const audioCtxRef  = useRef(null)
+  const workletRef   = useRef(null)
+  const micStreamRef = useRef(null)
+  const pcmPlayerRef = useRef(null)
   const frameFailRef = useRef(0)
+  const speakTimerRef = useRef(null)
+
+  useEffect(() => { pcmPlayerRef.current = createPCMPlayer() }, [])
 
   const processAlert = useCallback((text) => {
     const type = getAlertType(text)
@@ -145,10 +240,10 @@ export default function App() {
     if (type === 'clear') setCountClear(c => c + 1)
     if (type === 'alert') setCountAlert(c => c + 1)
     const now = new Date().toLocaleTimeString('en-US', { hour12: false })
-    setEvents(prev => [{ text: text.slice(0, 120), type, time: now, id: Date.now() + Math.random() }, ...prev.slice(0, 49)])
+    setEvents(prev => [{ text: text.slice(0, 140), type, time: now, id: Date.now() + Math.random() }, ...prev.slice(0, 49)])
   }, [])
 
-  // Frame polling
+  // Frame polling from Vision Agent
   useEffect(() => {
     let active = true
     const poll = async () => {
@@ -156,11 +251,7 @@ export default function App() {
         try {
           const res = await fetch(`${VISION_BASE}/frame`)
           const data = await res.json()
-          if (data.frame) {
-            setFrame(`data:image/jpeg;base64,${data.frame}`)
-            setStatus('live')
-            frameFailRef.current = 0
-          }
+          if (data.frame) { setFrame(`data:image/jpeg;base64,${data.frame}`); setStatus('live'); frameFailRef.current = 0 }
         } catch {
           frameFailRef.current++
           if (frameFailRef.current > 5) setStatus('offline')
@@ -172,7 +263,21 @@ export default function App() {
     return () => { active = false }
   }, [])
 
-  // Alert WebSocket
+  // Agent status polling
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const res = await fetch(`${ORCH_BASE}/status`)
+        const data = await res.json()
+        setAgentStatus({ vision: data.vision || 'error', nyc: data.nyc || 'error' })
+      } catch { /* orchestrator may not be up */ }
+    }
+    poll()
+    const id = setInterval(poll, 10000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Alert WebSocket (Vision Agent)
   useEffect(() => {
     let ws, timer
     const connect = () => {
@@ -224,50 +329,128 @@ export default function App() {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Voice — AudioWorklet captures PCM → orchestrator → Gemini Live
+  //         Responses decoded as PCM Int16 @ 24kHz and played back
+  // ---------------------------------------------------------------------------
+  // Guard to prevent multiple simultaneous voice sessions
+  const voiceActiveRef = useRef(false)
+  const closeTimerRef = useRef(null)
+
+  // Full cleanup — closes everything including WS
+  const cleanupVoice = useCallback(() => {
+    voiceActiveRef.current = false
+    setRecording(false)
+    setSpeaking(false)
+    clearTimeout(speakTimerRef.current)
+    clearTimeout(closeTimerRef.current)
+    workletRef.current?.port.close()
+    workletRef.current?.disconnect()
+    workletRef.current = null
+    try { audioCtxRef.current?.close() } catch {}
+    audioCtxRef.current = null
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    const ws = voiceWsRef.current
+    voiceWsRef.current = null
+    if (ws && ws.readyState <= WebSocket.OPEN) {
+      try { ws.close() } catch {}
+    }
+  }, [])
+
   const startVoice = async () => {
-    if (recording) return
+    // Always clean up any previous session first
+    cleanupVoice()
     setRecording(true)
+    pcmPlayerRef.current?.reset()
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      })
+      micStreamRef.current = stream
+
+      const ctx = new AudioContext({ sampleRate: 16000 })
+      audioCtxRef.current = ctx
+
+      const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' })
+      const url = URL.createObjectURL(blob)
+      await ctx.audioWorklet.addModule(url)
+      URL.revokeObjectURL(url)
+
+      const source = ctx.createMediaStreamSource(stream)
+      const worklet = new AudioWorkletNode(ctx, 'pcm-processor')
+      workletRef.current = worklet
+      source.connect(worklet)
+
       const ws = new WebSocket(`ws://localhost:8000/voice`)
       voiceWsRef.current = ws
+
       ws.onopen = () => {
-        const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
-        mediaRecRef.current = mr
-        mr.ondataavailable = (e) => {
-          if (ws.readyState === WebSocket.OPEN && e.data.size > 0) ws.send(e.data)
+        console.log('[DroneWatch] Voice WS open')
+        worklet.port.onmessage = (e) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(e.data)
         }
-        mr.start(100)
       }
-      ws.onmessage = (e) => {
-        if (typeof e.data === 'string') {
+
+      ws.onmessage = async (e) => {
+        if (e.data instanceof Blob) {
+          setSpeaking(true)
+          clearTimeout(speakTimerRef.current)
+          speakTimerRef.current = setTimeout(() => setSpeaking(false), 600)
+          const buf = await e.data.arrayBuffer()
+          pcmPlayerRef.current?.playChunk(buf)
+        } else if (typeof e.data === 'string') {
           try {
             const msg = JSON.parse(e.data)
             if (msg.text) processAlert(`[Voice AI]: ${msg.text}`)
-          } catch { processAlert(`[Voice AI]: ${e.data}`) }
+            if (msg.error) processAlert(`[Voice Error]: ${msg.error}`)
+          } catch {
+            processAlert(`[Voice AI]: ${e.data}`)
+          }
         }
       }
+
       ws.onerror = () => {
-        processAlert('[Voice]: Cannot connect to Orchestrator (port 8000). Using text mode.')
-        stopVoice()
+        processAlert('[Voice Error]: WebSocket to ws://localhost:8000/voice failed — is the Orchestrator running?')
+        cleanupVoice()
       }
-      ws.onclose = stopVoice
+
+      ws.onclose = () => {
+        // WS closed (server-side after Gemini finishes, or timeout)
+        cleanupVoice()
+      }
+
+      // 8-second connect timeout
+      setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          processAlert('[Voice Error]: Orchestrator not responding on port 8000 — restart it.')
+          cleanupVoice()
+        }
+      }, 8000)
+
     } catch (err) {
       processAlert(`[Voice Error]: ${err.message}`)
-      stopVoice()
+      cleanupVoice()
     }
   }
 
-  const stopVoice = () => {
+  // Stop mic capture only — keep WS open so Gemini can stream response audio back
+  const stopCapture = useCallback(() => {
     setRecording(false)
-    if (mediaRecRef.current?.state !== 'inactive') {
-      mediaRecRef.current?.stop()
-      mediaRecRef.current?.stream?.getTracks().forEach(t => t.stop())
-    }
-    voiceWsRef.current?.close()
-    mediaRecRef.current = null
-    voiceWsRef.current = null
-  }
+    workletRef.current?.port.close()
+    workletRef.current?.disconnect()
+    workletRef.current = null
+    try { audioCtxRef.current?.close() } catch {}
+    audioCtxRef.current = null
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    // Give Gemini up to 30s to finish responding, then auto-close
+    clearTimeout(closeTimerRef.current)
+    closeTimerRef.current = setTimeout(() => {
+      cleanupVoice()
+    }, 30000)
+  }, [cleanupVoice])
 
   const alertType = getAlertType(currentAlert)
   const badgeClass = status === 'live' ? 'badge badge-live' : status === 'offline' ? 'badge badge-offline' : 'badge badge-conn'
@@ -280,11 +463,18 @@ export default function App() {
           <div className="pulse-dot" />
           <span className="header-title">Drone<span>Watch</span></span>
         </div>
+        <div className="agent-pills">
+          <span className={`agent-pill ${agentStatus.vision === 'ok' ? 'ok' : agentStatus.vision === 'error' ? 'err' : ''}`}>
+            VISION
+          </span>
+          <span className={`agent-pill ${agentStatus.nyc === 'ok' ? 'ok' : agentStatus.nyc === 'error' ? 'err' : ''}`}>
+            NYC DATA
+          </span>
+        </div>
         <span className={badgeClass}>{status.toUpperCase()}</span>
       </header>
 
       <main className="main">
-        {/* Camera Feed */}
         <section className="panel-feed">
           {!frame && (
             <div className="no-feed">
@@ -303,7 +493,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* Alerts Panel */}
         <aside className="panel-alerts">
           <div className="alerts-header">
             <span>ALERT FEED</span>
@@ -330,25 +519,39 @@ export default function App() {
           <div className="voice-section">
             <div className="query-row">
               <input
+                id="text-query-input"
                 className="query-input"
                 value={query}
                 onChange={e => setQuery(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && sendQuery()}
                 placeholder="Ask DroneWatch..."
               />
-              <button className="query-submit" onClick={sendQuery}>ASK</button>
+              <button id="ask-btn" className="query-submit" onClick={sendQuery}>ASK</button>
             </div>
+
             <button
+              id="voice-btn"
               className={`voice-btn${recording ? ' voice-btn-active' : ''}`}
               onMouseDown={startVoice}
-              onMouseUp={stopVoice}
-              onMouseLeave={() => recording && stopVoice()}
+              onMouseUp={stopCapture}
+              onMouseLeave={() => recording && stopCapture()}
               onTouchStart={e => { e.preventDefault(); startVoice() }}
-              onTouchEnd={stopVoice}
+              onTouchEnd={stopCapture}
             >
-              <span>🎤</span>
+              {recording
+                ? <div className="waveform">{[0,1,2,3,4].map(i => <div key={i} className="waveform-bar" />)}</div>
+                : <span>🎤</span>
+              }
               <span>{recording ? 'LISTENING...' : 'HOLD TO TALK'}</span>
             </button>
+
+            {speaking && (
+              <div className="speaking-indicator">
+                <div className="speaking-dot" />
+                <span>DRONEWATCH SPEAKING</span>
+              </div>
+            )}
+
             <div className="voice-hint">Barge-in supported · Powered by Gemini Live API</div>
           </div>
         </aside>

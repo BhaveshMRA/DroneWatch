@@ -193,6 +193,19 @@
   @keyframes pulse-btn { 0%,100% { box-shadow: 0 0 0 0 rgba(255,51,85,.4); } 50% { box-shadow: 0 0 0 8px rgba(255,51,85,0); } }
   .voice-hint { font-size: 10px; color: var(--dim); text-align: center; letter-spacing: 1px; }
 
+  .waveform { display:flex; align-items:center; justify-content:center; gap:3px; height:20px; }
+  .waveform-bar { width:3px; border-radius:2px; background:var(--red); animation:wave .6s ease-in-out infinite alternate; }
+  .waveform-bar:nth-child(1){animation-delay:0s}
+  .waveform-bar:nth-child(2){animation-delay:.1s}
+  .waveform-bar:nth-child(3){animation-delay:.2s}
+  .waveform-bar:nth-child(4){animation-delay:.1s}
+  .waveform-bar:nth-child(5){animation-delay:0s}
+  @keyframes wave { from{height:4px} to{height:18px} }
+
+  .speaking-indicator { display:none; align-items:center; gap:6px; font-size:10px; color:var(--accent); letter-spacing:1px; }
+  .speaking-indicator.active { display:flex; animation:fadeIn .3s ease; }
+  .speaking-dot { width:6px; height:6px; border-radius:50%; background:var(--accent); animation:pulse-dot .8s ease-in-out infinite; }
+
   /* Query input */
   .query-row {
     display: flex; gap: 6px;
@@ -279,9 +292,18 @@
         <button class="query-submit" id="querySubmit">ASK</button>
       </div>
       <button class="voice-btn" id="voiceBtn">
-        <span>🎤</span>
+        <span id="voiceIcon">🎤</span>
+        <div class="waveform" id="voiceWaveform" style="display:none">
+          <div class="waveform-bar"></div><div class="waveform-bar"></div>
+          <div class="waveform-bar"></div><div class="waveform-bar"></div>
+          <div class="waveform-bar"></div>
+        </div>
         <span id="voiceBtnLabel">HOLD TO TALK</span>
       </button>
+      <div class="speaking-indicator" id="speakingIndicator">
+        <div class="speaking-dot"></div>
+        <span>DRONEWATCH SPEAKING</span>
+      </div>
       <div class="voice-hint">Barge-in supported · Powered by Gemini Live API</div>
     </div>
   </aside>
@@ -475,49 +497,104 @@ async function fetchOrchAlert(question) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Voice (hold to talk → Gemini Live)
+// Voice — AudioWorklet PCM capture + PCM playback
 // ────────────────────────────────────────────────────────────────
-const voiceBtn  = document.getElementById('voiceBtn');
+const voiceBtn   = document.getElementById('voiceBtn');
 const voiceLabel = document.getElementById('voiceBtnLabel');
+const voiceIcon  = document.getElementById('voiceIcon');
+const voiceWave  = document.getElementById('voiceWaveform');
+const speakEl    = document.getElementById('speakingIndicator');
 let voiceWs = null;
-let audioCtx = null;
+let captureCtx = null, workletNode = null, micStream = null;
+let speakTimer = null;
+
+// PCM player — queued Int16 chunks at 24kHz
+const pcmPlayer = (() => {
+  let ctx = null, next = 0;
+  return {
+    play(buf) {
+      if (!ctx) { ctx = new AudioContext({ sampleRate: 24000 }); next = ctx.currentTime; }
+      const i16 = new Int16Array(buf);
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+      const ab = ctx.createBuffer(1, f32.length, 24000);
+      ab.getChannelData(0).set(f32);
+      const src = ctx.createBufferSource();
+      src.buffer = ab; src.connect(ctx.destination);
+      const at = Math.max(ctx.currentTime, next);
+      src.start(at); next = at + ab.duration;
+    },
+    reset() { next = ctx ? ctx.currentTime : 0; }
+  };
+})();
+
+const WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() { super(); this._buf = []; this._sz = 2048; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) this._buf.push(Math.max(-1, Math.min(1, ch[i])));
+    while (this._buf.length >= this._sz) {
+      const chunk = this._buf.splice(0, this._sz);
+      const i16 = new Int16Array(this._sz);
+      for (let i = 0; i < this._sz; i++) i16[i] = Math.round(chunk[i] * 32767);
+      this.port.postMessage(i16.buffer, [i16.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
 
 async function startVoice() {
   if (recording) return;
   recording = true;
   voiceBtn.classList.add('recording');
+  voiceIcon.style.display = 'none';
+  voiceWave.style.display = 'flex';
   voiceLabel.textContent = 'LISTENING...';
+  pcmPlayer.reset();
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+
+    captureCtx = new AudioContext({ sampleRate: 16000 });
+    const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+    const url  = URL.createObjectURL(blob);
+    await captureCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    const source = captureCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(captureCtx, 'pcm-processor');
+    source.connect(workletNode);
+
     voiceWs = new WebSocket(WS_VOICE);
 
     voiceWs.onopen = () => {
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-      mediaRecorder.ondataavailable = (e) => {
-        if (voiceWs && voiceWs.readyState === WebSocket.OPEN && e.data.size > 0) {
-          voiceWs.send(e.data);
-        }
+      workletNode.port.onmessage = (e) => {
+        if (voiceWs && voiceWs.readyState === WebSocket.OPEN) voiceWs.send(e.data);
       };
-      mediaRecorder.start(100); // chunk every 100ms
     };
 
-    voiceWs.onmessage = (e) => {
-      if (typeof e.data === 'string') {
+    voiceWs.onmessage = async (e) => {
+      if (e.data instanceof Blob) {
+        speakEl.classList.add('active');
+        clearTimeout(speakTimer);
+        speakTimer = setTimeout(() => speakEl.classList.remove('active'), 600);
+        pcmPlayer.play(await e.data.arrayBuffer());
+      } else if (typeof e.data === 'string') {
         try {
           const msg = JSON.parse(e.data);
           if (msg.text) processAlert(`[Voice AI]: ${msg.text}`);
           if (msg.error) processAlert(`[Error]: ${msg.error}`);
-        } catch(err) {
-          processAlert(`[Voice AI]: ${e.data}`);
-        }
-      } else {
-        // Play audio response
-        playAudioBytes(e.data);
+        } catch { processAlert(`[Voice AI]: ${e.data}`); }
       }
     };
 
-    voiceWs.onclose = () => stopVoice();
+    voiceWs.onclose = stopVoice;
     voiceWs.onerror = () => {
       processAlert('[Voice]: Cannot connect to Orchestrator Agent (port 8000). Using text mode.');
       stopVoice();
@@ -532,30 +609,15 @@ async function startVoice() {
 function stopVoice() {
   recording = false;
   voiceBtn.classList.remove('recording');
+  voiceIcon.style.display = '';
+  voiceWave.style.display = 'none';
   voiceLabel.textContent = 'HOLD TO TALK';
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-    mediaRecorder.stream.getTracks().forEach(t => t.stop());
-    mediaRecorder = null;
-  }
-  if (voiceWs) {
-    voiceWs.close();
-    voiceWs = null;
-  }
-}
-
-async function playAudioBytes(buffer) {
-  try {
-    if (!audioCtx) audioCtx = new AudioContext();
-    const arrayBuf = await buffer.arrayBuffer();
-    const decoded  = await audioCtx.decodeAudioData(arrayBuf);
-    const source   = audioCtx.createBufferSource();
-    source.buffer  = decoded;
-    source.connect(audioCtx.destination);
-    source.start();
-  } catch(e) {
-    console.warn('Audio playback error:', e);
-  }
+  speakEl.classList.remove('active');
+  clearTimeout(speakTimer);
+  workletNode && (workletNode.port.close(), workletNode.disconnect(), workletNode = null);
+  captureCtx && (captureCtx.close(), captureCtx = null);
+  micStream && (micStream.getTracks().forEach(t => t.stop()), micStream = null);
+  voiceWs && (voiceWs.close(), voiceWs = null);
 }
 
 // Hold to talk

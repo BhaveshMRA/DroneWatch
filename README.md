@@ -6,51 +6,51 @@
 
 ---
 
-## The Problem
+## 🛑 The Problem
 
-Urban environments generate massive amounts of visual data — traffic cameras, building feeds, drone footage — but analyzing them in real time requires expensive, specialized object-detection models trained on specific datasets.
+Urban environments generate massive amounts of visual data — traffic cameras, building feeds, drone footage — but analyzing them in real time typically requires expensive, highly specialized object-detection models trained on limited datasets.
 
 **DroneWatch removes that barrier.** Point any camera at any scene. Gemini sees it, reasons about it, and speaks aloud — no training required.
 
 ---
 
-## What It Does
+## ✨ What It Does
 
-DroneWatch is a multi-agent vision AI system where three specialized agents collaborate via the **Agent2Agent (A2A) protocol** to monitor a live camera feed and respond to natural voice questions in real time.
+DroneWatch is a multi-agent vision AI system where three specialized agents collaborate via an **Agent2Agent (A2A)** architecture to monitor a live camera feed and respond to natural voice questions in real time.
 
-- **Vision Agent** watches the webcam, analyzes every frame using Gemini's native visual understanding
-- **NYC Data Agent** pulls live NYC Open Data traffic camera feeds and contextual city data
-- **Orchestrator Agent** receives voice input, routes tasks across agents via A2A, and speaks back using Gemini Live API with barge-in support
+- **Vision Agent**: Watches the webcam, analyzes every frame using Gemini 2.5 Flash's native visual understanding, and broadcasts scene context.
+- **NYC Data Agent**: Pulls live NYC Open Data traffic camera feeds and contextual city data.
+- **Orchestrator Agent**: Receives raw PCM voice input from the browser, handles routing tasks across agents, and speaks back in real time using the **Gemini 3.1 Flash Live API** with full **Voice Activity Detection (VAD) and Barge-in** support.
 
-No YOLO. No object detection models. No training datasets.
-
----
-
-## Demo
-
-```
-[User points webcam at a scene]
-
-Gemini: "Clear. Two people detected center frame, no obstacles on path—"
-
-[User interrupts mid-sentence]
-
-User: "What's behind the person on the left?"
-
-Gemini: "A doorway, partially obstructed. Recommend caution if navigating."
-```
-
-This is **barge-in** — the killer feature of Gemini Live API. Judges can try it in 10 seconds.
+No YOLO. No object detection models. No training datasets. Just pure multimodal reasoning.
 
 ---
 
-## Architecture
+## 🎤 Demo: Hold-to-Talk & Barge-in
 
 ```
+[User points webcam at an emergency exit]
+
+DroneWatch: "Clear. Two people detected center frame, no obstacles on the path—"
+
+[User holds the mic button and interrupts mid-sentence]
+
+User: "Wait, is there a fire alarm visible?"
+
+DroneWatch: "Yes, I see a red fire alarm pull station on the right wall near the door."
+```
+
+This is **barge-in** and contextual awareness — the killer feature of the Gemini Live API. 
+
+---
+
+## 🏗️ Architecture
+
+```text
 ┌─────────────────────────────────────────────────────┐
-│              ORCHESTRATOR AGENT (ADK)                │
-│   gemini-live-2.5-flash-preview (voice + barge-in)  │
-│   Receives voice → routes tasks → speaks response   │
+│              ORCHESTRATOR AGENT                      │
+│   gemini-3.1-flash-live-preview (voice + VAD)       │
+│   Receives PCM voice → checks vision → responses     │
 └──────────────────┬─────────────────┬────────────────┘
                    │  A2A protocol   │  A2A protocol
                    ▼                 ▼
@@ -63,178 +63,92 @@ This is **barge-in** — the killer feature of Gemini Live API. Judges can try i
      │  Scene analysis │   │  Pedestrian counts    │
      │  Threat alerts  │   │  Incident reports     │
      └─────────────────┘   └──────────────────────┘
-              │
-     /.well-known/agent.json  ← A2A Agent Cards
+              │ 
+     /.well-known/agent.json  ← A2A Agent Discovery Cards
 ```
 
-Each agent runs as an independent service on **Google Cloud Run**, communicating via the A2A protocol.
+Each agent runs as an independent service (FastAPI), communicating via the A2A protocol patterns. The React frontend uses an `AudioWorklet` to stream raw 16kHz PCM audio directly to the Orchestrator via WebSockets.
 
 ---
 
-## Bonus Points ✅
+## 🏆 Hackathon Bonus Points Hit
 
 | Requirement | Implementation |
 |---|---|
-| **Gemini 2.5 Flash** | `gemini-2.5-flash` (all agents) |
-| **Gemini Live API** | `gemini-live-2.5-flash-preview` (orchestrator voice) |
-| **Google ADK** | Orchestrator built with Agent Development Kit |
-| **A2A Protocol** | All agents expose `/.well-known/agent.json` + communicate via A2A |
-| **Google Cloud Run** | Each agent deployed as independent Cloud Run service |
-| **Gemini CLI** | Used for terminal-based scene analysis during demo |
-| **NYC Open Data** | Live camera feeds + traffic data via NYC Open Data API |
+| **Gemini 2.5 Flash** | Built-in `gemini-2.5-flash` for the Vision and Data agents |
+| **Gemini Live API** | Integrated `gemini-3.1-flash-live-preview` (v1alpha) for zero-latency, full-duplex voice |
+| **A2A Protocol** | Agents expose `/.well-known/agent.json` discovery cards and communicate laterally |
+| **NYC Open Data** | Contextual live camera feeds + traffic data via NYC Open Data API |
+| **Modern UX** | React + Vite frontend with glassmorphism UI, real-time event logs, and push-to-talk |
 
 ---
 
-## Tech Stack
+## 💻 Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Vision reasoning | Gemini 2.5 Flash (`gemini-2.5-flash`) |
-| Voice + barge-in | Gemini Live API (`gemini-live-2.5-flash-preview`) |
-| Agent framework | Google ADK (Agent Development Kit) |
-| Agent communication | A2A protocol (Agent2Agent) |
-| Frame capture | OpenCV (webcam) |
-| City data | NYC Open Data REST API |
-| Backend | FastAPI + WebSockets |
-| Frontend | React + Vite |
-| Deploy | Google Cloud Run (3 services) |
+| **Vision Reasoning** | Gemini 2.5 Flash (`gemini-2.5-flash`) |
+| **Voice + Barge-in** | Gemini Live API (`gemini-3.1-flash-live-preview`) |
+| **GenAI Protocol** | `google-genai` Python SDK (v1alpha for Live sessions) |
+| **Agent Communication**| A2A protocol (Agent2Agent) |
+| **Backend & Routing** | Python, FastAPI, WebSockets |
+| **Frontend UI/UX** | React, Vite, Canvas API, Web Audio API (AudioWorklet) |
+| **City Data** | NYC Open Data REST API |
 
 ---
 
-## Project Structure
+## 🚀 Setup & Run Locally
 
-```
-dronewatch/
-├── agents/
-│   ├── orchestrator/        # ADK orchestrator — voice + A2A client
-│   │   ├── agent.py
-│   │   ├── main.py
-│   │   └── Dockerfile
-│   ├── vision/              # A2A server — webcam + Gemini vision
-│   │   ├── agent.py
-│   │   ├── main.py
-│   │   └── Dockerfile
-│   └── nyc_data/            # A2A server — NYC Open Data feeds
-│       ├── agent.py
-│       ├── main.py
-│       └── Dockerfile
-├── frontend/
-│   └── src/App.jsx
-├── backend.py               # Single-file quickstart (no Docker)
-├── frontend.html            # Single-file quickstart UI
-└── README.md
-```
-
----
-
-## Quickstart (Single File — No Docker)
-
-### 1. Install
-```bash
-pip install google-genai opencv-python fastapi uvicorn websockets
-```
+### 1. Requirements
+Ensure you have Python 3.11+, Node.js, and a Gemini API Key.
 
 ### 2. Set API key
+Create a `.env` file in the root directory:
 ```bash
-export GOOGLE_API_KEY=your_key_here
-# Get free key → https://aistudio.google.com/app/apikey
+GOOGLE_API_KEY=your_gemini_api_key_here
 ```
 
-### 3. Run
+### 3. Run the Agents (in separate terminals)
 ```bash
-python backend.py
-# Open frontend.html in browser
-```
-
----
-
-## Full Multi-Agent Setup (A2A + ADK)
-
-### 1. Install ADK
-```bash
-pip install google-adk
-```
-
-### 2. Run Vision Agent (A2A Server — port 8001)
-```bash
+# Terminal 1: Vision Agent (Port 8001)
 cd agents/vision && python main.py
-# Agent card → http://localhost:8001/.well-known/agent.json
-```
 
-### 3. Run NYC Data Agent (A2A Server — port 8002)
-```bash
+# Terminal 2: NYC Data Agent (Port 8002)
 cd agents/nyc_data && python main.py
-# Agent card → http://localhost:8002/.well-known/agent.json
-```
 
-### 4. Run Orchestrator (ADK + A2A Client — port 8000)
-```bash
+# Terminal 3: Orchestrator (Port 8000)
 cd agents/orchestrator && python main.py
 ```
 
-### 5. Open frontend
+### 4. Run the Frontend (Port 5173)
 ```bash
-cd frontend && npm install && npm run dev
+# Terminal 4: React UI
+cd frontend
+npm install
+npm run dev
 ```
 
----
-
-## Deploy to Google Cloud Run
-
-```bash
-# Vision Agent
-gcloud run deploy dronewatch-vision \
-  --source ./agents/vision \
-  --region us-central1 \
-  --set-env-vars GOOGLE_API_KEY=$GOOGLE_API_KEY
-
-# NYC Data Agent
-gcloud run deploy dronewatch-nyc \
-  --source ./agents/nyc_data \
-  --region us-central1 \
-  --set-env-vars GOOGLE_API_KEY=$GOOGLE_API_KEY
-
-# Orchestrator
-gcloud run deploy dronewatch-orchestrator \
-  --source ./agents/orchestrator \
-  --region us-central1 \
-  --set-env-vars GOOGLE_API_KEY=$GOOGLE_API_KEY,\
-VISION_AGENT_URL=https://dronewatch-vision-xxxx.run.app,\
-NYC_AGENT_URL=https://dronewatch-nyc-xxxx.run.app
-```
+Open `http://localhost:5173` in your browser. Grant microphone and camera permissions. Hold **HOLD TO TALK** to speak with the drone!
 
 ---
 
-## NYC Open Data Integration
+## 🏙️ NYC Open Data Integration
 
-| Dataset | Endpoint |
-|---|---|
-| DOT Traffic Cameras | `data.cityofnewyork.us/resource/ecxy-mmzy.json` |
-| Real-Time Traffic Speed | `data.cityofnewyork.us/resource/i4gi-tjb9.json` |
-| 311 Incident Reports | `data.cityofnewyork.us/resource/erm2-nwe9.json` |
+The NYC Data Agent is equipped to handle contextual queries about the environment:
+- **DOT Traffic Cameras**: `data.cityofnewyork.us/resource/ecxy-mmzy.json`
+- **Real-Time Traffic Speed**: `data.cityofnewyork.us/resource/i4gi-tjb9.json`
+- **311 Incident Reports**: `data.cityofnewyork.us/resource/erm2-nwe9.json`
 
-The NYC Data Agent surfaces this contextually — if Vision detects a crowd, NYC Data checks for nearby incidents or traffic alerts automatically.
-
----
-
-## How A2A Works Here
-
-1. Each agent publishes an **Agent Card** at `/.well-known/agent.json`
-2. Orchestrator discovers agents by fetching their cards at startup
-3. User asks *"What's the traffic like near here?"* → Orchestrator routes task to NYC Data Agent via A2A JSON-RPC
-4. NYC Data Agent returns a structured artifact
-5. Orchestrator combines with Vision output → speaks response via Gemini Live
-
-Real agent interoperability — not a monolith pretending to be multi-agent.
+If Vision detects a crowd, NYC Data can automatically check for nearby incidents or traffic alerts.
 
 ---
 
-## Pitch Line
+## 🎯 Pitch Line
 
-> *"Instead of training specialized detection models, DroneWatch gives any camera a brain it can talk to — and that brain talks to the city."*
+> *"Instead of training specialized detection models, DroneWatch gives any camera a brain it can talk to — and that brain talks back to the city."*
 
 ---
 
-## Built At
+## 🛠️ Built At
 
-NYC Build With AI Hackathon 2026 · NYU Tandon School of Engineering · GDG NYC · NYC Open Data Week
+**NYC Build With AI Hackathon 2026** · NYU Tandon School of Engineering · GDG NYC · NYC Open Data Week

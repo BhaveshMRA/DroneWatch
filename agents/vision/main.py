@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 VISION_MODEL = "gemini-2.5-flash"
-FRAME_INTERVAL = 1.5  # seconds between Gemini analysis calls
+FRAME_INTERVAL = 10.0  # seconds between Gemini calls (free tier: 20 req/day = ~1/72min, use sparingly)
 
 SYSTEM_PROMPT = (
     "You are DroneWatch, a real-time vision AI co-pilot. "
@@ -141,10 +141,15 @@ async def analysis_loop():
                     latest_alert = mock
                 await broadcast_alert(mock)
         except Exception as exc:
-            logger.error(f"Analysis error: {exc}")
-            fallback = "CLEAR: Vision system warming up. Stand by."
-            with alert_lock:
-                latest_alert = fallback
+            err_str = str(exc)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                logger.warning("Rate limit hit — waiting 30s before next Gemini call")
+                await asyncio.sleep(30)
+            else:
+                logger.error(f"Analysis error: {exc}")
+                fallback = "CLEAR: Vision system warming up. Stand by."
+                with alert_lock:
+                    latest_alert = fallback
         await asyncio.sleep(FRAME_INTERVAL)
 
 async def broadcast_alert(text: str):
@@ -163,6 +168,22 @@ async def broadcast_alert(text: str):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # macOS fix: trigger camera permission request from main thread first.
+    # OpenCV cannot spin the AVFoundation run loop from a background thread,
+    # so we do a quick synchronous open/release here before the capture thread starts.
+    def _request_camera_permission():
+        try:
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                cap.release()
+                logger.info("Camera permission granted — webcam accessible")
+            else:
+                logger.warning("Camera opened but not accessible — will use mock frames")
+        except Exception as exc:
+            logger.warning(f"Camera permission pre-check failed: {exc}")
+
+    await asyncio.to_thread(_request_camera_permission)
+
     t = threading.Thread(target=webcam_capture_thread, daemon=True)
     t.start()
     time.sleep(0.5)
