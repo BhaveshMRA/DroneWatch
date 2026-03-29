@@ -5,34 +5,6 @@ const HOST_IP = window.location.hostname;
 const VISION_BASE = `http://${HOST_IP}:8001`;
 const ORCH_BASE   = 'https://dronewatch-orchestrator-joz4weiltq-uk.a.run.app';
 
-// AudioWorklet processor — captures raw PCM Int16 chunks at 16kHz
-const WORKLET_CODE = `
-class PCMProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buffer = [];
-    this._bufferSize = 2048;
-  }
-  process(inputs) {
-    const input = inputs[0];
-    if (!input || !input[0]) return true;
-    const samples = input[0];
-    for (let i = 0; i < samples.length; i++) {
-      this._buffer.push(Math.max(-1, Math.min(1, samples[i])));
-    }
-    while (this._buffer.length >= this._bufferSize) {
-      const chunk = this._buffer.splice(0, this._bufferSize);
-      const int16 = new Int16Array(this._bufferSize);
-      for (let i = 0; i < this._bufferSize; i++) {
-        int16[i] = Math.round(chunk[i] * 32767);
-      }
-      this.port.postMessage(int16.buffer, [int16.buffer]);
-    }
-    return true;
-  }
-}
-registerProcessor('pcm-processor', PCMProcessor);
-`
 
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;700&display=swap');
@@ -177,39 +149,7 @@ function getAlertType(text) {
   return 'neutral'
 }
 
-// ---------------------------------------------------------------------------
-// PCM player — queued playback of Int16 PCM chunks from Gemini Live (24kHz)
-// ---------------------------------------------------------------------------
-function createPCMPlayer() {
-  let ctx = null
-  let nextStartTime = 0
 
-  function getCtx() {
-    if (!ctx) {
-      ctx = new AudioContext({ sampleRate: 24000 })
-      nextStartTime = ctx.currentTime
-    }
-    return ctx
-  }
-
-  return {
-    playChunk(arrayBuffer) {
-      const audioCtx = getCtx()
-      const int16 = new Int16Array(arrayBuffer)
-      const float32 = new Float32Array(int16.length)
-      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0
-      const buf = audioCtx.createBuffer(1, float32.length, 24000)
-      buf.getChannelData(0).set(float32)
-      const src = audioCtx.createBufferSource()
-      src.buffer = buf
-      src.connect(audioCtx.destination)
-      const startAt = Math.max(audioCtx.currentTime, nextStartTime)
-      src.start(startAt)
-      nextStartTime = startAt + buf.duration
-    },
-    reset() { nextStartTime = ctx ? ctx.currentTime : 0 },
-  }
-}
 
 export default function App() {
   const [frame, setFrame] = useState(null)
@@ -225,16 +165,11 @@ export default function App() {
   const [agentStatus, setAgentStatus] = useState({ vision: 'connecting', nyc: 'connecting' })
 
   const ts = useTimestamp()
-  const orchWsRef    = useRef(null)
-  const voiceWsRef   = useRef(null)
-  const audioCtxRef  = useRef(null)
-  const workletRef   = useRef(null)
-  const micStreamRef = useRef(null)
-  const pcmPlayerRef = useRef(null)
-  const frameFailRef = useRef(0)
-  const speakTimerRef = useRef(null)
-
-  useEffect(() => { pcmPlayerRef.current = createPCMPlayer() }, [])
+  const orchWsRef      = useRef(null)
+  const mediaRecRef    = useRef(null)
+  const audioChunksRef = useRef([])
+  const micStreamRef   = useRef(null)
+  const frameFailRef   = useRef(0)
 
   const processAlert = useCallback((text) => {
     const type = getAlertType(text)
@@ -332,6 +267,7 @@ export default function App() {
   }
 
   // ---------------------------------------------------------------------------
+<<<<<<< HEAD
   // Voice — MediaRecorder captures audio → POST /voice-ask → SpeechSynthesis
   // Hold to Talk: records while button held, sends on release
   // ---------------------------------------------------------------------------
@@ -341,85 +277,68 @@ export default function App() {
 
   const cleanupVoice = useCallback(() => {
     setRecording(false)
-    setSpeaking(false)
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop()
-    }
-    mediaRecorderRef.current = null
-    audioChunksRef.current = []
-    micStreamRef.current?.getTracks().forEach(t => t.stop())
-    micStreamRef.current = null
-  }, [])
-
+  // Voice — MediaRecorder captures WebM audio → POST /voice-ask → TTS
+  // ---------------------------------------------------------------------------
   const startVoice = async () => {
-    if (recording) return
-    cleanupVoice()
-    setRecording(true)
-    audioChunksRef.current = []
-
+    if (mediaRecRef.current) return   // already recording
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       micStreamRef.current = stream
+      audioChunksRef.current = []
 
-      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
-      mediaRecorderRef.current = recorder
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data)
-      }
-
-      recorder.start()
+      const rec = new MediaRecorder(stream)
+      mediaRecRef.current = rec
+      rec.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
+      rec.start()
+      setRecording(true)
     } catch (err) {
-      processAlert(`[Voice Error]: Mic access denied — ${err.message}`)
-      cleanupVoice()
+      processAlert(`[Voice Error]: ${err.message}`)
     }
   }
 
-  const stopCapture = useCallback(async () => {
-    if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') return
+  const stopAndSend = useCallback(async () => {
+    const rec = mediaRecRef.current
+    if (!rec) return
+    mediaRecRef.current = null
     setRecording(false)
+
+    await new Promise(resolve => {
+      rec.onstop = resolve
+      rec.stop()
+    })
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+
+    const chunks = audioChunksRef.current
+    audioChunksRef.current = []
+    if (!chunks.length) return
+
+    const audioBlob = new Blob(chunks, { type: chunks[0].type || 'audio/webm' })
+    const form = new FormData()
+    form.append('audio', audioBlob, 'voice.webm')
+
     setSpeaking(true)
-
-    mediaRecorderRef.current.onstop = async () => {
-      const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-      audioChunksRef.current = []
-      micStreamRef.current?.getTracks().forEach(t => t.stop())
-      micStreamRef.current = null
-
-      try {
-        const form = new FormData()
-        form.append('audio', blob, 'voice.webm')
-
-        const res = await fetch(`${ORCH_BASE}/voice-ask`, {
-          method: 'POST',
-          body: form,
-        })
-
-        if (!res.ok) throw new Error(`Server error ${res.status}`)
-        const data = await res.json()
-
-        if (data.transcript) processAlert(`[You]: ${data.transcript}`)
-        if (data.text) {
-          processAlert(`[Voice AI]: ${data.text}`)
-          // Speak the response aloud
-          const utt = new SpeechSynthesisUtterance(data.text)
-          utt.rate = 1.05
-          utt.onend = () => setSpeaking(false)
-          window.speechSynthesis.speak(utt)
-        } else {
-          setSpeaking(false)
-        }
-      } catch (err) {
-        processAlert(`[Voice Error]: ${err.message}`)
+    processAlert('[You]: 🎤 (voice query sent...)')
+    try {
+      const res = await fetch(`${ORCH_BASE}/voice-ask`, { method: 'POST', body: form })
+      const data = await res.json()
+      if (data.transcript) processAlert(`[You]: ${data.transcript}`)
+      if (data.text) {
+        processAlert(`[Voice AI]: ${data.text}`)
+        const utt = new SpeechSynthesisUtterance(data.text)
+        utt.rate = 1.05
+        utt.onend = () => setSpeaking(false)
+        window.speechSynthesis.speak(utt)
+      } else {
         setSpeaking(false)
       }
+      if (data.error) processAlert(`[Voice Error]: ${data.error}`)
+    } catch (err) {
+      processAlert(`[Voice Error]: ${err.message}`)
+      setSpeaking(false)
     }
-
-    mediaRecorderRef.current.stop()
   }, [processAlert])
-
-
-
+>>>>>>> fc7d8f3 (feat: replace Gemini Live WebSocket voice with MediaRecorder + POST /voice-ask pipeline)
 
   const alertType = getAlertType(currentAlert)
   const badgeClass = status === 'live' ? 'badge badge-live' : status === 'offline' ? 'badge badge-offline' : 'badge badge-conn'
@@ -502,10 +421,10 @@ export default function App() {
               id="voice-btn"
               className={`voice-btn${recording ? ' voice-btn-active' : ''}`}
               onMouseDown={startVoice}
-              onMouseUp={stopCapture}
-              onMouseLeave={() => recording && stopCapture()}
+              onMouseUp={stopAndSend}
+              onMouseLeave={() => recording && stopAndSend()}
               onTouchStart={e => { e.preventDefault(); startVoice() }}
-              onTouchEnd={stopCapture}
+              onTouchEnd={stopAndSend}
             >
               {recording
                 ? <div className="waveform">{[0,1,2,3,4].map(i => <div key={i} className="waveform-bar" />)}</div>
@@ -521,7 +440,7 @@ export default function App() {
               </div>
             )}
 
-            <div className="voice-hint">Barge-in supported · Powered by Gemini Live API</div>
+            <div className="voice-hint">Hold to record · Powered by Gemini 2.5 Flash</div>
           </div>
         </aside>
       </main>

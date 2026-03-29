@@ -1,7 +1,8 @@
 """
 DroneWatch Orchestrator Agent — port 8000
 Built with Google ADK-style LlmAgent pattern.
-Uses Gemini Live API (gemini-live-2.5-flash-preview) for real-time voice with barge-in.
+Uses screenshot-based voice: POST /voice-ask accepts audio+frame multipart, transcribes
+via Gemini, and returns a JSON text response (no Live API required).
 Routes tasks to Vision (8001) and NYC Data (8002) via A2A.
 Uses new google.genai SDK (v1.x).
 """
@@ -30,7 +31,6 @@ logger.setLevel(logging.DEBUG)
 GOOGLE_API_KEY    = os.environ.get("GOOGLE_API_KEY", "")
 VISION_AGENT_URL  = os.environ.get("VISION_AGENT_URL", "http://localhost:8001")
 NYC_AGENT_URL     = os.environ.get("NYC_AGENT_URL", "http://localhost:8002")
-LIVE_MODEL        = "gemini-live-2.5-flash-preview"  # Gemini 2.5 Flash Live model (bidiGenerateContent)
 ADK_MODEL         = "gemini-2.5-flash"  # stable text/tool-call model
 
 ADK_INSTRUCTION = (
@@ -48,7 +48,7 @@ A2A_AGENT_CARD = {
     "version": "1.0.0",
     "url": "http://localhost:8000",
     "capabilities": {"streaming": True, "voice": True, "orchestrator": True},
-    "endpoints": {"voice": "/voice", "status": "/status", "alert": "/alert", "stream": "/ws"},
+    "endpoints": {"voice_ask": "/voice-ask", "status": "/status", "alert": "/alert", "stream": "/ws"},
     "agents": {"vision": VISION_AGENT_URL, "nyc_data": NYC_AGENT_URL},
 }
 
@@ -364,131 +364,87 @@ async def text_websocket(websocket: WebSocket):
             if websocket in active_text_sockets:
                 active_text_sockets.remove(websocket)
 
-@app.websocket("/voice")
-async def voice_websocket(websocket: WebSocket):
+@app.post("/voice-ask")
+async def voice_ask(
+    audio: UploadFile = File(...),
+):
     """
-    Voice WebSocket — Push-to-talk with Gemini Live API.
-    Uses send_realtime_input for audio which relies on server-side VAD.
-    IMPORTANT: Do NOT mix send_realtime_input with send_client_content(turn_complete)
-    — they use different turn management modes and mixing causes 1007 errors.
+    Screenshot-based voice endpoint.
+    Accepts a multipart audio file (WebM/OGG from MediaRecorder).
+    Steps:
+      1. Transcribe audio via Gemini inline_data
+      2. Fetch current frame from Vision Agent
+      3. Ask Gemini with transcript + frame image
+      4. Return { text, transcript }
     """
-    await websocket.accept()
-    logger.info("Voice WebSocket connected")
-
     if not GOOGLE_API_KEY:
-        await websocket.send_text(json.dumps({"error": "GOOGLE_API_KEY not set"}))
-        await websocket.close()
-        return
+        return {"error": "GOOGLE_API_KEY not set", "text": "", "transcript": ""}
 
-    client = genai.Client(
-        api_key=GOOGLE_API_KEY,
-        http_options={"api_version": "v1alpha"},
-    )
+    client = genai.Client(api_key=GOOGLE_API_KEY)
 
-    # Fetch current scene context so Gemini knows what the camera sees
-    scene_text = "No context available."
+    # ---- Step 1: Read audio bytes ----
+    audio_bytes = await audio.read()
+    audio_mime = audio.content_type or "audio/webm"
+    logger.info(f"voice-ask: received {len(audio_bytes)} bytes of {audio_mime}")
+
+    # ---- Step 2: Transcribe with Gemini ----
+    transcript = ""
     try:
-        scene_text = await analyze_scene()
-        logger.info(f"Fetched scene context: {scene_text[:80]}")
+        transcribe_response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ADK_MODEL,
+            contents=[
+                types.Part(
+                    inline_data=types.Blob(mime_type=audio_mime, data=audio_bytes)
+                ),
+                types.Part(text="Transcribe the spoken words in this audio clip. Return ONLY the transcription, no extra commentary."),
+            ],
+        )
+        transcript = transcribe_response.text.strip()
+        logger.info(f"Transcription: {transcript[:120]}")
     except Exception as exc:
-        logger.warning(f"Could not fetch scene context: {exc}")
+        logger.error(f"Transcription error: {exc}")
+        transcript = "(could not transcribe audio)"
 
-    live_config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        system_instruction=f"""You are DroneWatch, an AI drone surveillance co-pilot. 
-CRITICAL RULE: NEVER say you do not have visual capabilities. The system is feeding you the live camera view as text directly into this prompt. 
-When asked what you see, describe the scene EXACTLY as provided in the [Current camera view] data below. Be concise, professional, and confident, like a surveillance operator.
+    # ---- Step 3: Fetch camera frame ----
+    frame_b64 = None
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as hclient:
+            r = await hclient.get(f"{VISION_AGENT_URL}/frame")
+            frame_b64 = r.json().get("frame")
+    except Exception as exc:
+        logger.warning(f"Could not fetch camera frame: {exc}")
 
-[Current camera view]: {scene_text}""",
-    )
-
-    ws_open = True
+    # ---- Step 4: Ask Gemini with optional frame ----
+    contents = []
+    if frame_b64:
+        import base64
+        contents.append(types.Part(
+            inline_data=types.Blob(
+                mime_type="image/jpeg",
+                data=base64.b64decode(frame_b64),
+            )
+        ))
+    contents.append(types.Part(text=(
+        f"The user asked (via voice): {transcript}\n\n"
+        "You are DroneWatch, an AI drone surveillance co-pilot. "
+        "If an image of the camera view is provided, describe what you see. "
+        "Be concise and professional, like a calm surveillance operator."
+    )))
 
     try:
-        async with client.aio.live.connect(model=LIVE_MODEL, config=live_config) as session:
-            logger.info(f"Gemini Live session opened — model={LIVE_MODEL}")
-
-            async def send_audio():
-                nonlocal ws_open
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        if msg.get("type") == "websocket.disconnect":
-                            logger.info("Client released button — closing send loop")
-                            ws_open = False
-                            break
-                        if "bytes" in msg and msg["bytes"]:
-                            # Raw PCM Int16 from AudioWorklet — 16kHz mono
-                            # Server-side VAD handles turn detection automatically
-                            await session.send_realtime_input(
-                                audio=types.Blob(
-                                    mime_type="audio/pcm;rate=16000",
-                                    data=msg["bytes"],
-                                )
-                            )
-                except WebSocketDisconnect:
-                    logger.info("WS disconnected in send loop")
-                    ws_open = False
-                except Exception as exc:
-                    logger.error(f"Audio send error: {exc}")
-                    ws_open = False
-
-            async def receive_responses():
-                try:
-                    async for response in session.receive():
-                        if not ws_open:
-                            continue
-                        # Path 1 — direct audio blob
-                        if hasattr(response, "data") and response.data:
-                            logger.info(f"Gemini audio chunk: {len(response.data)} bytes")
-                            try:
-                                await websocket.send_bytes(response.data)
-                            except Exception:
-                                break
-                            continue
-                        # Path 2 — server_content → model_turn → parts
-                        sc = getattr(response, "server_content", None)
-                        if sc:
-                            mt = getattr(sc, "model_turn", None)
-                            if mt:
-                                for part in getattr(mt, "parts", []):
-                                    inline = getattr(part, "inline_data", None)
-                                    if inline and getattr(inline, "data", None):
-                                        try:
-                                            await websocket.send_bytes(inline.data)
-                                        except Exception:
-                                            break
-                                    txt = getattr(part, "text", None)
-                                    if txt:
-                                        logger.info(f"Transcript: {txt[:80]}")
-                                        try:
-                                            await websocket.send_text(
-                                                json.dumps({"type": "transcript", "text": txt})
-                                            )
-                                        except Exception:
-                                            break
-                except WebSocketDisconnect:
-                    pass
-                except Exception as exc:
-                    # 1007 on session teardown is expected — don't log as error
-                    err_str = str(exc)
-                    if "1007" in err_str:
-                        logger.info(f"Gemini Live session closed (1007 — normal teardown)")
-                    else:
-                        logger.error(f"Audio receive error: {type(exc).__name__}: {exc}")
-
-            await asyncio.gather(send_audio(), receive_responses())
-
-    except WebSocketDisconnect:
-        pass
+        answer_response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ADK_MODEL,
+            contents=contents,
+        )
+        answer = answer_response.text.strip()
     except Exception as exc:
-        logger.error(f"Live session error: {type(exc).__name__}: {exc}")
-        try:
-            await websocket.send_text(json.dumps({"error": str(exc)}))
-        except Exception:
-            pass
-    finally:
-        logger.info("Voice WebSocket disconnected")
+        logger.error(f"Gemini answer error: {exc}")
+        answer = f"System error: {str(exc)[:100]}"
+
+    logger.info(f"voice-ask answer: {answer[:120]}")
+    return {"text": answer, "transcript": transcript}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
