@@ -13,8 +13,9 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from google import genai
 from google.genai import types
@@ -29,7 +30,7 @@ logger.setLevel(logging.DEBUG)
 GOOGLE_API_KEY    = os.environ.get("GOOGLE_API_KEY", "")
 VISION_AGENT_URL  = os.environ.get("VISION_AGENT_URL", "http://localhost:8001")
 NYC_AGENT_URL     = os.environ.get("NYC_AGENT_URL", "http://localhost:8002")
-LIVE_MODEL        = "gemini-3.1-flash-live-preview"  # latest Live model (bidiGenerateContent)
+LIVE_MODEL        = "gemini-live-2.5-flash-preview"  # Gemini 2.5 Flash Live model (bidiGenerateContent)
 ADK_MODEL         = "gemini-2.5-flash"  # stable text/tool-call model
 
 ADK_INSTRUCTION = (
@@ -265,6 +266,83 @@ async def get_alert():
     except Exception as exc:
         return {"text": "CLEAR: System initializing.", "status": "error", "error": str(exc)}
 
+@app.post("/voice-ask")
+async def voice_ask(audio: UploadFile = File(...)):
+    """
+    Hold-to-Talk endpoint.
+    Receives a WebM/OGG audio blob from the browser.
+    1. Transcribes the audio with gemini-2.5-flash
+    2. Fetches the current camera frame from the Vision Agent
+    3. Sends frame + transcript to gemini-2.5-flash for a multimodal answer
+    Returns: { transcript, text }
+    """
+    if not GOOGLE_API_KEY:
+        return JSONResponse({"error": "GOOGLE_API_KEY not configured"}, status_code=500)
+
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    audio_bytes = await audio.read()
+    mime = audio.content_type or "audio/webm"
+
+    # --- Step 1: Transcribe audio ---
+    try:
+        transcription_response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ADK_MODEL,
+            contents=[
+                types.Content(parts=[
+                    types.Part(text="Transcribe this audio exactly as spoken. Return only the spoken words, nothing else."),
+                    types.Part(inline_data=types.Blob(mime_type=mime, data=audio_bytes)),
+                ])
+            ],
+        )
+        transcript = transcription_response.text.strip()
+        logger.info(f"Transcript: {transcript}")
+    except Exception as exc:
+        logger.error(f"Transcription error: {exc}")
+        transcript = "What do you see?"
+
+    # --- Step 2: Fetch current camera frame ---
+    frame_b64 = None
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as http:
+            frame_resp = await http.get(f"{VISION_AGENT_URL}/frame")
+            frame_b64 = frame_resp.json().get("frame")
+    except Exception as exc:
+        logger.warning(f"Could not fetch frame: {exc}")
+
+    # --- Step 3: Multimodal answer ---
+    try:
+        parts = [
+            types.Part(text=(
+                f"You are DroneWatch, an AI surveillance co-pilot. "
+                f"The user asked: \"{transcript}\"\n"
+                f"The attached image is the current live camera view. "
+                f"Answer concisely in 1-3 sentences based on what you see."
+            ))
+        ]
+        if frame_b64:
+            import base64
+            parts.append(types.Part(inline_data=types.Blob(
+                mime_type="image/jpeg",
+                data=base64.b64decode(frame_b64),
+            )))
+
+        answer_response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ADK_MODEL,
+            contents=[types.Content(parts=parts)],
+        )
+        answer = answer_response.text.strip()
+        logger.info(f"Answer: {answer}")
+    except Exception as exc:
+        logger.error(f"Answer error: {exc}")
+        answer = "I'm having trouble analyzing the scene right now."
+
+    # Broadcast to any connected text sockets too
+    await broadcast_text(f"[Voice AI]: {answer}")
+
+    return {"transcript": transcript, "text": answer}
+
 @app.websocket("/ws")
 async def text_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -413,4 +491,5 @@ When asked what you see, describe the scene EXACTLY as provided in the [Current 
         logger.info("Voice WebSocket disconnected")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

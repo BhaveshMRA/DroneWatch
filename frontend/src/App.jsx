@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 const HOST_IP = window.location.hostname;
+// Vision MUST be local — the webcam lives on this machine, not in the cloud
 const VISION_BASE = `http://${HOST_IP}:8001`;
-const ORCH_BASE   = `http://${HOST_IP}:8000`;
+const ORCH_BASE   = 'https://dronewatch-orchestrator-joz4weiltq-uk.a.run.app';
 
 // AudioWorklet processor — captures raw PCM Int16 chunks at 16kHz
 const WORKLET_CODE = `
@@ -282,7 +283,7 @@ export default function App() {
   useEffect(() => {
     let ws, timer
     const connect = () => {
-      ws = new WebSocket(`ws://${window.location.hostname}:8001/ws`)
+      ws = new WebSocket(`ws://${HOST_IP}:8001/ws`)
       ws.onopen = () => { setWsStatus('CONNECTED'); setStatus('live') }
       ws.onmessage = (e) => { if (e.data !== 'ping') processAlert(e.data) }
       ws.onclose = () => { setWsStatus('RECONNECTING'); setStatus('connecting'); timer = setTimeout(connect, 2000) }
@@ -296,7 +297,7 @@ export default function App() {
   useEffect(() => {
     let ws, timer
     const connect = () => {
-      ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`)
+      ws = new WebSocket('wss://dronewatch-orchestrator-joz4weiltq-uk.a.run.app/ws')
       orchWsRef.current = ws
       ws.onmessage = (e) => processAlert(`[AI]: ${e.data}`)
       ws.onclose = () => { timer = setTimeout(connect, 3000) }
@@ -331,127 +332,94 @@ export default function App() {
   }
 
   // ---------------------------------------------------------------------------
-  // Voice — AudioWorklet captures PCM → orchestrator → Gemini Live
-  //         Responses decoded as PCM Int16 @ 24kHz and played back
+  // Voice — MediaRecorder captures audio → POST /voice-ask → SpeechSynthesis
+  // Hold to Talk: records while button held, sends on release
   // ---------------------------------------------------------------------------
-  // Guard to prevent multiple simultaneous voice sessions
-  const voiceActiveRef = useRef(false)
-  const closeTimerRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const audioChunksRef   = useRef([])
+  const closeTimerRef    = useRef(null)
 
-  // Full cleanup — closes everything including WS
   const cleanupVoice = useCallback(() => {
-    voiceActiveRef.current = false
     setRecording(false)
     setSpeaking(false)
-    clearTimeout(speakTimerRef.current)
-    clearTimeout(closeTimerRef.current)
-    workletRef.current?.port.close()
-    workletRef.current?.disconnect()
-    workletRef.current = null
-    try { audioCtxRef.current?.close() } catch {}
-    audioCtxRef.current = null
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+    mediaRecorderRef.current = null
+    audioChunksRef.current = []
     micStreamRef.current?.getTracks().forEach(t => t.stop())
     micStreamRef.current = null
-    const ws = voiceWsRef.current
-    voiceWsRef.current = null
-    if (ws && ws.readyState <= WebSocket.OPEN) {
-      try { ws.close() } catch {}
-    }
   }, [])
 
   const startVoice = async () => {
-    // Always clean up any previous session first
+    if (recording) return
     cleanupVoice()
     setRecording(true)
-    pcmPlayerRef.current?.reset()
+    audioChunksRef.current = []
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
-      })
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       micStreamRef.current = stream
 
-      const ctx = new AudioContext({ sampleRate: 16000 })
-      audioCtxRef.current = ctx
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      mediaRecorderRef.current = recorder
 
-      const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' })
-      const url = URL.createObjectURL(blob)
-      await ctx.audioWorklet.addModule(url)
-      URL.revokeObjectURL(url)
-
-      const source = ctx.createMediaStreamSource(stream)
-      const worklet = new AudioWorkletNode(ctx, 'pcm-processor')
-      workletRef.current = worklet
-      source.connect(worklet)
-
-      const ws = new WebSocket(`ws://${window.location.hostname}:8000/voice`)
-      voiceWsRef.current = ws
-
-      ws.onopen = () => {
-        console.log('[DroneWatch] Voice WS open')
-        worklet.port.onmessage = (e) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(e.data)
-        }
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
       }
 
-      ws.onmessage = async (e) => {
-        if (e.data instanceof Blob) {
-          setSpeaking(true)
-          clearTimeout(speakTimerRef.current)
-          speakTimerRef.current = setTimeout(() => setSpeaking(false), 600)
-          const buf = await e.data.arrayBuffer()
-          pcmPlayerRef.current?.playChunk(buf)
-        } else if (typeof e.data === 'string') {
-          try {
-            const msg = JSON.parse(e.data)
-            if (msg.text) processAlert(`[Voice AI]: ${msg.text}`)
-            if (msg.error) processAlert(`[Voice Error]: ${msg.error}`)
-          } catch {
-            processAlert(`[Voice AI]: ${e.data}`)
-          }
-        }
-      }
-
-      ws.onerror = () => {
-        processAlert('[Voice Error]: WebSocket to ws://localhost:8000/voice failed — is the Orchestrator running?')
-        cleanupVoice()
-      }
-
-      ws.onclose = () => {
-        // WS closed (server-side after Gemini finishes, or timeout)
-        cleanupVoice()
-      }
-
-      // 8-second connect timeout
-      setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          processAlert('[Voice Error]: Orchestrator not responding on port 8000 — restart it.')
-          cleanupVoice()
-        }
-      }, 8000)
-
+      recorder.start()
     } catch (err) {
-      processAlert(`[Voice Error]: ${err.message}`)
+      processAlert(`[Voice Error]: Mic access denied — ${err.message}`)
       cleanupVoice()
     }
   }
 
-  // Stop mic capture only — keep WS open so Gemini can stream response audio back
-  const stopCapture = useCallback(() => {
+  const stopCapture = useCallback(async () => {
+    if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') return
     setRecording(false)
-    workletRef.current?.port.close()
-    workletRef.current?.disconnect()
-    workletRef.current = null
-    try { audioCtxRef.current?.close() } catch {}
-    audioCtxRef.current = null
-    micStreamRef.current?.getTracks().forEach(t => t.stop())
-    micStreamRef.current = null
-    // Give Gemini up to 30s to finish responding, then auto-close
-    clearTimeout(closeTimerRef.current)
-    closeTimerRef.current = setTimeout(() => {
-      cleanupVoice()
-    }, 30000)
-  }, [cleanupVoice])
+    setSpeaking(true)
+
+    mediaRecorderRef.current.onstop = async () => {
+      const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+      audioChunksRef.current = []
+      micStreamRef.current?.getTracks().forEach(t => t.stop())
+      micStreamRef.current = null
+
+      try {
+        const form = new FormData()
+        form.append('audio', blob, 'voice.webm')
+
+        const res = await fetch(`${ORCH_BASE}/voice-ask`, {
+          method: 'POST',
+          body: form,
+        })
+
+        if (!res.ok) throw new Error(`Server error ${res.status}`)
+        const data = await res.json()
+
+        if (data.transcript) processAlert(`[You]: ${data.transcript}`)
+        if (data.text) {
+          processAlert(`[Voice AI]: ${data.text}`)
+          // Speak the response aloud
+          const utt = new SpeechSynthesisUtterance(data.text)
+          utt.rate = 1.05
+          utt.onend = () => setSpeaking(false)
+          window.speechSynthesis.speak(utt)
+        } else {
+          setSpeaking(false)
+        }
+      } catch (err) {
+        processAlert(`[Voice Error]: ${err.message}`)
+        setSpeaking(false)
+      }
+    }
+
+    mediaRecorderRef.current.stop()
+  }, [processAlert])
+
+
+
 
   const alertType = getAlertType(currentAlert)
   const badgeClass = status === 'live' ? 'badge badge-live' : status === 'offline' ? 'badge badge-offline' : 'badge badge-conn'
