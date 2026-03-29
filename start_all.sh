@@ -12,20 +12,17 @@ fi
 
 echo "Starting Vision Agent (8001)..."
 cd agents/vision
-
-nohup python main.py > /tmp/vision.log 2>&1 &
+nohup env PORT=8001 python main.py > /tmp/vision.log 2>&1 &
 cd ../..
 
 echo "Starting NYC Data Agent (8002)..."
 cd agents/nyc_data
-
-nohup python main.py > /tmp/nyc.log 2>&1 &
+nohup env PORT=8002 python main.py > /tmp/nyc.log 2>&1 &
 cd ../..
 
 echo "Starting Orchestrator Agent (8000)..."
 cd agents/orchestrator
-
-nohup python main.py > /tmp/orch.log 2>&1 &
+nohup env PORT=8000 python main.py > /tmp/orch.log 2>&1 &
 cd ../..
 
 echo "All agents started! Check logs:"

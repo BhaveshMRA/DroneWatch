@@ -3,7 +3,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 const HOST_IP = window.location.hostname;
 // Vision MUST be local — the webcam lives on this machine, not in the cloud
 const VISION_BASE = `http://${HOST_IP}:8001`;
-const ORCH_BASE   = 'https://dronewatch-orchestrator-joz4weiltq-uk.a.run.app';
+const ORCH_BASE   = `http://${HOST_IP}:8000`;
 
 
 const STYLES = `
@@ -267,16 +267,6 @@ export default function App() {
   }
 
   // ---------------------------------------------------------------------------
-<<<<<<< HEAD
-  // Voice — MediaRecorder captures audio → POST /voice-ask → SpeechSynthesis
-  // Hold to Talk: records while button held, sends on release
-  // ---------------------------------------------------------------------------
-  const mediaRecorderRef = useRef(null)
-  const audioChunksRef   = useRef([])
-  const closeTimerRef    = useRef(null)
-
-  const cleanupVoice = useCallback(() => {
-    setRecording(false)
   // Voice — MediaRecorder captures WebM audio → POST /voice-ask → TTS
   // ---------------------------------------------------------------------------
   const startVoice = async () => {
@@ -338,7 +328,6 @@ export default function App() {
       setSpeaking(false)
     }
   }, [processAlert])
->>>>>>> fc7d8f3 (feat: replace Gemini Live WebSocket voice with MediaRecorder + POST /voice-ask pipeline)
 
   const alertType = getAlertType(currentAlert)
   const badgeClass = status === 'live' ? 'badge badge-live' : status === 'offline' ? 'badge badge-offline' : 'badge badge-conn'
