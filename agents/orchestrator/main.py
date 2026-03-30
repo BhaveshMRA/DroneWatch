@@ -266,14 +266,44 @@ async def get_alert():
     except Exception as exc:
         return {"text": "CLEAR: System initializing.", "status": "error", "error": str(exc)}
 
+
+@app.post("/analyze-frame")
+async def analyze_frame(image: str = Form(...)):
+    """
+    Accepts a base64 JPEG from the browser (captured via canvas/getUserMedia).
+    Sends it to Gemini for surveillance analysis and returns a text alert.
+    """
+    import base64
+    if not GOOGLE_API_KEY:
+        return {"text": "CLEAR: API key not configured."}
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    try:
+        img_data = base64.b64decode(image)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ADK_MODEL,
+            contents=[types.Content(parts=[
+                types.Part(text=(
+                    "You are DroneWatch, an AI surveillance co-pilot analysing a live feed. "
+                    "In 1 sentence, describe any notable activity or threats. "
+                    "Start with ALERT: if there is something concerning, or CLEAR: if the scene is normal."
+                )),
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=img_data)),
+            ])],
+        )
+        return {"text": response.text.strip()}
+    except Exception as exc:
+        logger.error(f"analyze-frame error: {exc}")
+        return {"text": "CLEAR: Scene analysis unavailable."}
+
 @app.post("/voice-ask")
-async def voice_ask(audio: UploadFile = File(...)):
+async def voice_ask(audio: UploadFile = File(...), image: str = Form(None)):
     """
     Hold-to-Talk endpoint.
-    Receives a WebM/OGG audio blob from the browser.
-    1. Transcribes the audio with gemini-2.5-flash
-    2. Fetches the current camera frame from the Vision Agent
-    3. Sends frame + transcript to gemini-2.5-flash for a multimodal answer
+    Receives a WebM/OGG audio blob + optional base64 JPEG frame from the browser.
+    1. Transcribes the audio with Gemini
+    2. Uses the supplied image (or falls back to fetching from Vision Agent)
+    3. Sends frame + transcript to Gemini for a multimodal answer
     Returns: { transcript, text }
     """
     if not GOOGLE_API_KEY:
@@ -301,14 +331,24 @@ async def voice_ask(audio: UploadFile = File(...)):
         logger.error(f"Transcription error: {exc}")
         transcript = "What do you see?"
 
-    # --- Step 2: Fetch current camera frame ---
-    frame_b64 = None
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as http:
-            frame_resp = await http.get(f"{VISION_AGENT_URL}/frame")
-            frame_b64 = frame_resp.json().get("frame")
-    except Exception as exc:
-        logger.warning(f"Could not fetch frame: {exc}")
+    # --- Step 2: Use browser-supplied frame, or fall back to Vision Agent ---
+    import base64
+    frame_bytes = None
+    if image:
+        try:
+            frame_bytes = base64.b64decode(image)
+            logger.info("Using browser-supplied webcam frame")
+        except Exception:
+            pass
+    if not frame_bytes:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as http:
+                frame_resp = await http.get(f"{VISION_AGENT_URL}/frame")
+                frame_b64 = frame_resp.json().get("frame")
+                if frame_b64:
+                    frame_bytes = base64.b64decode(frame_b64)
+        except Exception as exc:
+            logger.warning(f"Could not fetch frame from Vision Agent: {exc}")
 
     # --- Step 3: Multimodal answer ---
     try:
@@ -320,11 +360,10 @@ async def voice_ask(audio: UploadFile = File(...)):
                 f"Answer concisely in 1-3 sentences based on what you see."
             ))
         ]
-        if frame_b64:
-            import base64
+        if frame_bytes:
             parts.append(types.Part(inline_data=types.Blob(
                 mime_type="image/jpeg",
-                data=base64.b64decode(frame_b64),
+                data=frame_bytes,
             )))
 
         answer_response = await asyncio.to_thread(

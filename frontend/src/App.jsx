@@ -152,7 +152,7 @@ function getAlertType(text) {
 
 
 export default function App() {
-  const [frame, setFrame] = useState(null)
+  const [frame, setFrame] = useState(null)  // unused for display now, kept for compat
   const [status, setStatus] = useState('connecting')
   const [wsStatus, setWsStatus] = useState('CONNECTING')
   const [currentAlert, setCurrentAlert] = useState('Waiting for scene analysis...')
@@ -170,6 +170,8 @@ export default function App() {
   const audioChunksRef = useRef([])
   const micStreamRef   = useRef(null)
   const frameFailRef   = useRef(0)
+  const videoRef       = useRef(null)
+  const canvasRef      = useRef(null)
 
   const processAlert = useCallback((text) => {
     const type = getAlertType(text)
@@ -180,24 +182,36 @@ export default function App() {
     setEvents(prev => [{ text: text.slice(0, 140), type, time: now, id: Date.now() + Math.random() }, ...prev.slice(0, 49)])
   }, [])
 
-  // Frame polling from Vision Agent
+  // Helper: capture current webcam frame as base64 JPEG
+  const captureFrame = useCallback(() => {
+    const video = videoRef.current
+    const canvas = canvasRef.current
+    if (!video || !canvas || video.readyState < 2) return null
+    canvas.width = video.videoWidth || 640
+    canvas.height = video.videoHeight || 480
+    canvas.getContext('2d').drawImage(video, 0, 0)
+    return canvas.toDataURL('image/jpeg', 0.7).split(',')[1]  // raw base64
+  }, [])
+
+  // Browser webcam capture via getUserMedia
   useEffect(() => {
-    let active = true
-    const poll = async () => {
-      while (active) {
-        try {
-          const res = await fetch(`${VISION_BASE}/frame`)
-          const data = await res.json()
-          if (data.frame) { setFrame(`data:image/jpeg;base64,${data.frame}`); setStatus('live'); frameFailRef.current = 0 }
-        } catch {
-          frameFailRef.current++
-          if (frameFailRef.current > 5) setStatus('offline')
+    let stream
+    const start = async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          videoRef.current.play()
         }
-        await new Promise(r => setTimeout(r, 200))
+        setStatus('live')
+        setWsStatus('CONNECTED')
+      } catch (err) {
+        setStatus('offline')
+        setWsStatus('RECONNECTING')
       }
     }
-    poll()
-    return () => { active = false }
+    start()
+    return () => { stream?.getTracks().forEach(t => t.stop()) }
   }, [])
 
   // Agent status polling
@@ -214,26 +228,29 @@ export default function App() {
     return () => clearInterval(id)
   }, [])
 
-  // Alert polling (REST-based, works on HTTPS without mixed content issues)
+  // Alert polling — send frame to Orchestrator/Vision for AI analysis every 8s
   useEffect(() => {
     let active = true
     const poll = async () => {
+      // small delay so webcam has time to start
+      await new Promise(r => setTimeout(r, 3000))
       while (active) {
         try {
-          const res = await fetch(`${VISION_BASE}/analyze`, { method: 'POST' })
-          const data = await res.json()
-          if (data.text) processAlert(data.text)
-          setWsStatus('CONNECTED')
-          setStatus('live')
-        } catch {
-          setWsStatus('RECONNECTING')
-        }
-        await new Promise(r => setTimeout(r, 5000))
+          const b64 = captureFrame()
+          if (b64) {
+            const form = new FormData()
+            form.append('image', b64)
+            const res = await fetch(`${ORCH_BASE}/analyze-frame`, { method: 'POST', body: form })
+            const data = await res.json()
+            if (data.text) processAlert(data.text)
+          }
+        } catch { /* silent */ }
+        await new Promise(r => setTimeout(r, 8000))
       }
     }
     poll()
     return () => { active = false }
-  }, [processAlert])
+  }, [processAlert, captureFrame])
 
   const sendQuery = async () => {
     if (!query.trim()) return
@@ -296,6 +313,10 @@ export default function App() {
     const form = new FormData()
     form.append('audio', audioBlob, 'voice.webm')
 
+    // Attach current webcam frame so Orchestrator can describe what the user sees
+    const b64 = captureFrame()
+    if (b64) form.append('image', b64)
+
     setSpeaking(true)
     processAlert('[You]: 🎤 (voice query sent...)')
     try {
@@ -316,7 +337,7 @@ export default function App() {
       processAlert(`[Voice Error]: ${err.message}`)
       setSpeaking(false)
     }
-  }, [processAlert])
+  }, [processAlert, captureFrame])
 
   const alertType = getAlertType(currentAlert)
   const badgeClass = status === 'live' ? 'badge badge-live' : status === 'offline' ? 'badge badge-offline' : 'badge badge-conn'
@@ -342,14 +363,21 @@ export default function App() {
 
       <main className="main">
         <section className="panel-feed">
-          {!frame && (
+          <video
+            ref={videoRef}
+            className="camera-img"
+            autoPlay
+            playsInline
+            muted
+            style={{ display: status === 'offline' ? 'none' : 'block' }}
+          />
+          <canvas ref={canvasRef} style={{ display: 'none' }} />
+          {status === 'offline' && (
             <div className="no-feed">
               <div className="no-feed-icon">🛸</div>
-              <div>Connecting to Vision Agent...</div>
-              <div style={{ fontSize: '11px', color: '#3a4a5a' }}>localhost:8001</div>
+              <div>Camera access denied or unavailable</div>
             </div>
           )}
-          {frame && <img className="camera-img" src={frame} alt="Live camera feed" />}
           <div className="hud">
             <div className="corner tl" /><div className="corner tr" />
             <div className="corner bl" /><div className="corner br" />
