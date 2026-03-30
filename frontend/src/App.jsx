@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 
 const HOST_IP = window.location.hostname;
-// Vision MUST be local — the webcam lives on this machine, not in the cloud
-const VISION_BASE = `http://${HOST_IP}:8001`;
-const ORCH_BASE   = `http://${HOST_IP}:8000`;
+// Production: both services are on Cloud Run
+const VISION_BASE = 'https://dronewatch-vision-944212881044.us-east4.run.app';
+const ORCH_BASE   = 'https://dronewatch-orchestrator-944212881044.us-east4.run.app';
 
 
 const STYLES = `
@@ -214,31 +214,25 @@ export default function App() {
     return () => clearInterval(id)
   }, [])
 
-  // Alert WebSocket (Vision Agent)
+  // Alert polling (REST-based, works on HTTPS without mixed content issues)
   useEffect(() => {
-    let ws, timer
-    const connect = () => {
-      ws = new WebSocket(`ws://${HOST_IP}:8001/ws`)
-      ws.onopen = () => { setWsStatus('CONNECTED'); setStatus('live') }
-      ws.onmessage = (e) => { if (e.data !== 'ping') processAlert(e.data) }
-      ws.onclose = () => { setWsStatus('RECONNECTING'); setStatus('connecting'); timer = setTimeout(connect, 2000) }
-      ws.onerror = () => setStatus('offline')
+    let active = true
+    const poll = async () => {
+      while (active) {
+        try {
+          const res = await fetch(`${VISION_BASE}/analyze`, { method: 'POST' })
+          const data = await res.json()
+          if (data.text) processAlert(data.text)
+          setWsStatus('CONNECTED')
+          setStatus('live')
+        } catch {
+          setWsStatus('RECONNECTING')
+        }
+        await new Promise(r => setTimeout(r, 5000))
+      }
     }
-    connect()
-    return () => { ws?.close(); clearTimeout(timer) }
-  }, [processAlert])
-
-  // Orchestrator text WS
-  useEffect(() => {
-    let ws, timer
-    const connect = () => {
-      ws = new WebSocket('wss://dronewatch-orchestrator-joz4weiltq-uk.a.run.app/ws')
-      orchWsRef.current = ws
-      ws.onmessage = (e) => processAlert(`[AI]: ${e.data}`)
-      ws.onclose = () => { timer = setTimeout(connect, 3000) }
-    }
-    connect()
-    return () => { ws?.close(); clearTimeout(timer) }
+    poll()
+    return () => { active = false }
   }, [processAlert])
 
   const sendQuery = async () => {
@@ -246,22 +240,17 @@ export default function App() {
     const q = query.trim()
     setQuery('')
     processAlert(`[YOU]: ${q}`)
-    const ws = orchWsRef.current
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(q)
-    } else {
+    try {
+      const res = await fetch(`${ORCH_BASE}/alert`)
+      const data = await res.json()
+      processAlert(data.text || 'No response')
+    } catch {
       try {
-        const res = await fetch(`${ORCH_BASE}/alert`)
+        const res = await fetch(`${VISION_BASE}/analyze`, { method: 'POST' })
         const data = await res.json()
-        processAlert(data.text || 'No response')
+        processAlert(data.text || 'ERROR: Vision agent offline')
       } catch {
-        try {
-          const res = await fetch(`${VISION_BASE}/analyze`, { method: 'POST' })
-          const data = await res.json()
-          processAlert(data.text || 'ERROR: Vision agent offline')
-        } catch {
-          processAlert('ERROR: Cannot reach DroneWatch agents.')
-        }
+        processAlert('ERROR: Cannot reach DroneWatch agents.')
       }
     }
   }
