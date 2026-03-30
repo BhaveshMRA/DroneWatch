@@ -170,3 +170,5 @@ If Vision detects a crowd, NYC Data can automatically check for nearby incidents
 ## 🛠️ Built At
 
 **NYC Build With AI Hackathon 2026** · NYU Tandon School of Engineering · GDG NYC · NYC Open Data Week
+
+## CodeRabbit AI Review Enabled
